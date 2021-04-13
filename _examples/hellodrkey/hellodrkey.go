@@ -17,26 +17,18 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"flag"
 	"fmt"
+	"os"
+	"regexp"
 	"time"
 
 	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/drkey"
 	"github.com/scionproto/scion/go/lib/drkey/protocol"
 	"github.com/scionproto/scion/go/lib/sciond"
+	"github.com/scionproto/scion/go/lib/snet"
 )
-
-const (
-	sciondForClient = "[fd00:f00d:cafe::7f00:b]:30255"
-	sciondForServer = "127.0.0.19:30255"
-)
-
-// These next variables are also used as constants in the code
-var timestamp = time.Now().UTC()
-var srcIA, _ = addr.IAFromString("1-ff00:0:111")
-var dstIA, _ = addr.IAFromString("1-ff00:0:112")
-var srcHost = addr.HostFromIPStr("127.0.0.1")
-var dstHost = addr.HostFromIPStr("fd00:f00d:cafe::7f00:a")
 
 // check just ensures the error is nil, or complains and quits
 func check(e error) {
@@ -49,8 +41,8 @@ type Client struct {
 	sciond sciond.Connector
 }
 
-func NewClient(sciondPath string) Client {
-	sciond, err := sciond.NewService(sciondPath).Connect(context.Background())
+func NewClient(sciondAddr string) Client {
+	sciond, err := sciond.NewService(sciondAddr).Connect(context.Background())
 	check(err)
 	return Client{
 		sciond: sciond,
@@ -62,13 +54,14 @@ func (c Client) HostKey(meta drkey.Lvl2Meta) drkey.Lvl2Key {
 	defer cancelF()
 
 	// get L2 key: (slow path)
-	key, err := c.sciond.DRKeyGetLvl2Key(ctx, meta, timestamp)
+	key, err := c.sciond.DRKeyGetLvl2Key(ctx, meta, time.Now().UTC())
 	check(err)
 	return key
 }
 
-func ThisClientAndMeta() (Client, drkey.Lvl2Meta) {
-	c := NewClient(sciondForClient)
+func ThisClientAndMeta(sciondAddr string,
+	srcIA addr.IA, srcHost addr.HostAddr, dstIA addr.IA, dstHost addr.HostAddr) (Client, drkey.Lvl2Meta) {
+	c := NewClient(sciondAddr)
 	meta := drkey.Lvl2Meta{
 		KeyType:  drkey.Host2Host,
 		Protocol: "piskes",
@@ -84,8 +77,8 @@ type Server struct {
 	sciond sciond.Connector
 }
 
-func NewServer(sciondPath string) Server {
-	sciond, err := sciond.NewService(sciondPath).Connect(context.Background())
+func NewServer(sciondAddr string) Server {
+	sciond, err := sciond.NewService(sciondAddr).Connect(context.Background())
 	check(err)
 	return Server{
 		sciond: sciond,
@@ -102,9 +95,10 @@ func (s Server) dsForServer(meta drkey.Lvl2Meta) drkey.DelegationSecret {
 		SrcIA:    meta.SrcIA,
 		DstIA:    meta.DstIA,
 	}
-	lvl2Key, err := s.sciond.DRKeyGetLvl2Key(ctx, dsMeta, timestamp)
+	now := time.Now().UTC()
+	lvl2Key, err := s.sciond.DRKeyGetLvl2Key(ctx, dsMeta, now)
 	check(err)
-	fmt.Printf("Only the server obtains it: DS key = %s\n", hex.EncodeToString(lvl2Key.Key))
+	fmt.Printf("DS key = %s, epoch = %s\n", hex.EncodeToString(lvl2Key.Key), lvl2Key.Epoch)
 	ds := drkey.DelegationSecret{
 		Protocol: lvl2Key.Protocol,
 		Epoch:    lvl2Key.Epoch,
@@ -112,6 +106,14 @@ func (s Server) dsForServer(meta drkey.Lvl2Meta) drkey.DelegationSecret {
 		DstIA:    lvl2Key.DstIA,
 		Key:      lvl2Key.Key,
 	}
+	next := lvl2Key.Epoch.NotAfter.Add(1 * time.Second)
+	lvl2KeyNext, err := s.sciond.DRKeyGetLvl2Key(ctx, dsMeta, next)
+	check(err)
+	fmt.Printf("Next DS key = %s, epoch = %s\n", hex.EncodeToString(lvl2KeyNext.Key), lvl2KeyNext.Epoch)
+	prev := lvl2Key.Epoch.NotBefore.Add(-1 * time.Second)
+	lvl2KeyPrev, err := s.sciond.DRKeyGetLvl2Key(ctx, dsMeta, prev)
+	check(err)
+	fmt.Printf("Prev DS key = %s, epoch = %s\n", hex.EncodeToString(lvl2KeyPrev.Key), lvl2KeyPrev.Epoch)
 	return ds
 }
 
@@ -122,8 +124,9 @@ func (s Server) HostKeyFromDS(meta drkey.Lvl2Meta, ds drkey.DelegationSecret) dr
 	return derived
 }
 
-func ThisServerAndMeta() (Server, drkey.Lvl2Meta) {
-	server := NewServer(sciondForServer)
+func ThisServerAndMeta(sciondAddr string,
+	srcIA addr.IA, srcHost addr.HostAddr, dstIA addr.IA, dstHost addr.HostAddr) (Server, drkey.Lvl2Meta) {
+	server := NewServer(sciondAddr)
 	meta := drkey.Lvl2Meta{
 		KeyType:  drkey.Host2Host,
 		Protocol: "piskes",
@@ -135,20 +138,89 @@ func ThisServerAndMeta() (Server, drkey.Lvl2Meta) {
 	return server, meta
 }
 
+var addrRegexp = regexp.MustCompile(`^(\d+-[\d:A-Fa-f]+),\[([^\]]+)\]$`)
+
+const (
+	addrRegexpIaIndex = 1
+	addrRegexpL3Index = 2
+)
+
+func addrFromString(address string) (snet.SCIONAddress, error) {
+	parts := addrRegexp.FindStringSubmatch(address)
+	if parts == nil {
+		return snet.SCIONAddress{}, fmt.Errorf("no valid SCION address: %q", address)
+	}
+	ia, err := addr.IAFromString(parts[addrRegexpIaIndex])
+	if err != nil {
+		return snet.SCIONAddress{},
+			fmt.Errorf("invalid IA string: %v", parts[addrRegexpIaIndex])
+	}
+	var l3 addr.HostAddr
+	if hostSVC := addr.HostSVCFromString(parts[addrRegexpL3Index]); hostSVC != addr.SvcNone {
+		l3 = hostSVC
+	} else {
+		l3 = addr.HostFromIPStr(parts[addrRegexpL3Index])
+		if l3 == nil {
+			return snet.SCIONAddress{},
+				fmt.Errorf("invalid IP address string: %v", parts[addrRegexpL3Index])
+		}
+	}
+	return snet.SCIONAddress{IA: ia, Host: l3}, nil
+}
+
 func main() {
 	var clientKey, serverKey drkey.Lvl2Key
 
-	client, metaClient := ThisClientAndMeta()
-	t0 := time.Now()
-	clientKey = client.HostKey(metaClient)
-	durationClient := time.Since(t0)
+	var clientRole bool
+	var serverRole bool
+	var sciondAddr string
+	var srcAddr string
+	var dstAddr string
+	flag.BoolVar(&clientRole, "client", false, "Do client side derivation")
+	flag.BoolVar(&serverRole, "server", false, "Do server side derivation")
+	flag.StringVar(&sciondAddr, "sciond", "127.0.0.1:30255", "SCIOND address")
+	flag.StringVar(&srcAddr, "src", "1-ff00:0:111,[127.0.0.1]", "Source address")
+	flag.StringVar(&dstAddr, "dst", "1-ff00:0:112,[fd00:f00d:cafe::7f00:a]", "Destination address")
 
-	server, metaServer := ThisServerAndMeta()
-	ds := server.dsForServer(metaServer)
-	t0 = time.Now()
-	serverKey = server.HostKeyFromDS(metaServer, ds)
-	durationServer := time.Since(t0)
 
-	fmt.Printf("Client,\thost key = %s\tduration = %s\n", hex.EncodeToString(clientKey.Key), durationClient)
-	fmt.Printf("Server,\thost key = %s\tduration = %s\n", hex.EncodeToString(serverKey.Key), durationServer)
+	flag.Parse()
+	if !clientRole && !serverRole {
+		clientRole = true
+		serverRole = true
+	}
+
+	srcSCIONAddr, err := addrFromString(srcAddr)
+	if err != nil {
+		fmt.Println(err)
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+
+	dstSCIONAddr, err := addrFromString(dstAddr)
+	if err != nil {
+		fmt.Println(err)
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+
+	if clientRole {
+		client, metaClient := ThisClientAndMeta(sciondAddr, srcSCIONAddr.IA, srcSCIONAddr.Host, dstSCIONAddr.IA, dstSCIONAddr.Host)
+		t0 := time.Now()
+		clientKey = client.HostKey(metaClient)
+		durationClient := time.Since(t0)
+
+		fmt.Printf("Client: key = %s, epoch = %s, duration = %s\n",
+			hex.EncodeToString(clientKey.Key), clientKey.Epoch, durationClient)
+	}
+
+	if serverRole {
+		server, metaServer := ThisServerAndMeta(sciondAddr, srcSCIONAddr.IA, srcSCIONAddr.Host, dstSCIONAddr.IA, dstSCIONAddr.Host)
+		ds := server.dsForServer(metaServer)
+		t0 := time.Now()
+		serverKey = server.HostKeyFromDS(metaServer, ds)
+		durationServer := time.Since(t0)
+
+		fmt.Printf("Server: key = %s, epoch = %s, duration = %s\n",
+			hex.EncodeToString(serverKey.Key), ds.Epoch, durationServer)
+	}
 }
