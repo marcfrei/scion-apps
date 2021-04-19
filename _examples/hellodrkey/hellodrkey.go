@@ -15,6 +15,9 @@
 package main
 
 import (
+	"C"
+	"unsafe"
+
 	"context"
 	"encoding/hex"
 	"flag"
@@ -166,6 +169,29 @@ func addrFromString(address string) (snet.SCIONAddress, error) {
 		}
 	}
 	return snet.SCIONAddress{IA: ia, Host: l3}, nil
+}
+
+//export GetDelegationSecret
+func GetDelegationSecret(sciondAddr *C.char, srcIA, dstIA uint64, valTime int64, ds unsafe.Pointer) {
+	sd, err := sciond.NewService(C.GoString(sciondAddr)).Connect(context.Background())
+	check(err)
+
+	ctx, cancelF := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelF()
+
+	dsMeta := drkey.Lvl2Meta{
+		KeyType:  drkey.AS2AS,
+		Protocol: "piskes",
+		SrcIA:    addr.IAInt(srcIA).IA(),
+		DstIA:    addr.IAInt(dstIA).IA(),
+	}
+	lvl2Key, err := sd.DRKeyGetLvl2Key(ctx, dsMeta, time.Unix(valTime, 0).UTC())
+	check(err)
+
+	*(*int64)(unsafe.Pointer(uintptr(ds) + 0)) = lvl2Key.Epoch.NotBefore.Unix()
+	*(*int64)(unsafe.Pointer(uintptr(ds) + 8)) = lvl2Key.Epoch.NotAfter.Unix()
+	copy((*[16]byte)(unsafe.Pointer(uintptr(ds) + 16))[:], lvl2Key.Key)
+	// See https://github.com/golang/go/wiki/cgo#turning-c-arrays-into-go-slices
 }
 
 func main() {
