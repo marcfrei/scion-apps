@@ -172,7 +172,8 @@ func addrFromString(address string) (snet.SCIONAddress, error) {
 }
 
 //export GetDelegationSecret
-func GetDelegationSecret(sciondAddr *C.char, srcIA, dstIA uint64, valTime int64, ds unsafe.Pointer) {
+func GetDelegationSecret(sciondAddr *C.char, srcIA, dstIA uint64, valTime int64,
+	validityNotBefore, validityNotAfter *int64, key unsafe.Pointer) {
 	sd, err := sciond.NewService(C.GoString(sciondAddr)).Connect(context.Background())
 	check(err)
 
@@ -188,10 +189,9 @@ func GetDelegationSecret(sciondAddr *C.char, srcIA, dstIA uint64, valTime int64,
 	lvl2Key, err := sd.DRKeyGetLvl2Key(ctx, dsMeta, time.Unix(valTime, 0).UTC())
 	check(err)
 
-	*(*int64)(unsafe.Pointer(uintptr(ds) + 0)) = lvl2Key.Epoch.NotBefore.Unix()
-	*(*int64)(unsafe.Pointer(uintptr(ds) + 8)) = lvl2Key.Epoch.NotAfter.Unix()
-	copy((*[16]byte)(unsafe.Pointer(uintptr(ds) + 16))[:], lvl2Key.Key)
-	// See https://github.com/golang/go/wiki/cgo#turning-c-arrays-into-go-slices
+	*validityNotBefore = lvl2Key.Epoch.NotBefore.Unix()
+	*validityNotAfter = lvl2Key.Epoch.NotAfter.Unix()
+	copy((*[16]byte)(key)[:], lvl2Key.Key)
 }
 
 func main() {
@@ -207,7 +207,6 @@ func main() {
 	flag.StringVar(&sciondAddr, "sciond", "127.0.0.1:30255", "SCIOND address")
 	flag.StringVar(&srcAddr, "src", "1-ff00:0:111,[127.0.0.1]", "Source address")
 	flag.StringVar(&dstAddr, "dst", "1-ff00:0:112,[fd00:f00d:cafe::7f00:a]", "Destination address")
-
 
 	flag.Parse()
 	if !clientRole && !serverRole {

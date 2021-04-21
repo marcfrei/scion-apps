@@ -27,20 +27,15 @@ int main() {
 	int64_t t_now = tv.tv_sec;
 
 	struct delegation_secret ds;
-	char ds_buf[sizeof ds.validity_not_before + sizeof ds.validity_not_after + sizeof ds.key];
-	memset(ds_buf, 0, sizeof ds_buf);
+	memset(&ds, 0, sizeof ds);
 
-	GetDelegationSecret("127.0.0.1:30255", 0x0011ffaa00010d69, 0x0011ffaa00010e97, t_now, ds_buf);
-
-	size_t i = 0;
-	memcpy(&ds.validity_not_before, &ds_buf[i], sizeof ds.validity_not_before);
-	i += sizeof ds.validity_not_before;
-	memcpy(&ds.validity_not_after, &ds_buf[i], sizeof ds.validity_not_after);
-	i += sizeof ds.validity_not_after;
-	memcpy(&ds.key, &ds_buf[i], sizeof ds.key);
+	assert(sizeof ds.validity_not_before == sizeof (GoInt64));
+	assert(sizeof ds.validity_not_after == sizeof (GoInt64));
+	GetDelegationSecret("127.0.0.1:30255", 0x0011ffaa00010d69, 0x0011ffaa00010e97, t_now,
+		(GoInt64 *)&ds.validity_not_before, (GoInt64 *)&ds.validity_not_after, ds.key);
 
 	printf("DS key = ");
-	for (i = 0; i < sizeof ds.key; i++) {
+	for (size_t i = 0; i < sizeof ds.key; i++) {
 		printf("%02x", ds.key[i]);
 	}
 	printf(", epoch = [");
