@@ -68,6 +68,10 @@ func main() {
 	id := flag.String("id", "bwtester", "Element ID")
 	logDir := flag.String("log_dir", "./logs", "Log directory")
 
+	var localAddr net.UDPAddr
+	flag.Var(&localAddr, "l", "Local address")
+	_ = serverPort
+
 	flag.Parse()
 
 	// Setup logging
@@ -84,15 +88,15 @@ func main() {
 			log.Must.FileHandler(fmt.Sprintf("%s/%s.log", *logDir, *id),
 				fmt15.Fmt15Format(nil)))))
 
-	err := runServer(uint16(*serverPort))
+	err := runServer(localAddr)
 	if err != nil {
 		LogFatal("Unable to start server", "err", err)
 	}
 }
 
-func runServer(port uint16) error {
+func runServer(localAddr net.UDPAddr) error {
 
-	conn, err := appnet.ListenPort(port)
+	conn, err := appnet.Listen(localAddr.Host)
 	if err != nil {
 		return err
 	}
