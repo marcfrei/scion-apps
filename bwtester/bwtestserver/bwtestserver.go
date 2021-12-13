@@ -68,7 +68,7 @@ func main() {
 	id := flag.String("id", "bwtester", "Element ID")
 	logDir := flag.String("log_dir", "./logs", "Log directory")
 
-	var localAddr net.UDPAddr
+	var localAddr snet.UDPAddr
 	flag.Var(&localAddr, "l", "Local address")
 	_ = serverPort
 
@@ -94,7 +94,7 @@ func main() {
 	}
 }
 
-func runServer(localAddr net.UDPAddr) error {
+func runServer(localAddr snet.UDPAddr) error {
 
 	conn, err := appnet.Listen(localAddr.Host)
 	if err != nil {
