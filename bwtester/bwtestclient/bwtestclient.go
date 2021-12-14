@@ -271,6 +271,10 @@ func main() {
 	)
 
 	flag.Usage = printUsage
+
+	var localAddr snet.UDPAddr
+	flag.Var(&localAddr, "l", "Local address")
+
 	flag.StringVar(&serverCCAddrStr, "s", "", "Server SCION Address")
 	flag.StringVar(&serverBwpStr, "sc", DefaultBwtestParameters, "Server->Client test parameter")
 	flag.StringVar(&clientBwpStr, "cs", DefaultBwtestParameters, "Client->Server test parameter")
@@ -314,16 +318,17 @@ func main() {
 		appnet.SetPath(serverCCAddr, path)
 	}
 
-	CCConn, err = appnet.DialAddr(serverCCAddr)
-	Check(err)
-
-	// get the port used by clientCC after it bound to the dispatcher (because it might be 0)
-	clientCCAddr := CCConn.LocalAddr().(*net.UDPAddr)
 	// Address of client data channel (DC)
-	clientDCAddr := &net.UDPAddr{IP: clientCCAddr.IP, Port: clientCCAddr.Port + 1}
+	clientCCAddr := &net.UDPAddr{IP: localAddr.Host.IP, Port: localAddr.Host.Port, Zone: localAddr.Host.Zone}
+	clientDCAddr := &net.UDPAddr{IP: localAddr.Host.IP, Port: localAddr.Host.Port + 1, Zone: localAddr.Host.Zone}
 	// Address of server data channel (DC)
 	serverDCAddr := serverCCAddr.Copy()
 	serverDCAddr.Host.Port = serverCCAddr.Host.Port + 1
+
+	// Control channel connection
+	CCConn, err = appnet.DefNetwork().Dial(
+		context.TODO(), "udp", clientCCAddr, serverCCAddr, addr.SvcNone)
+	Check(err)
 
 	// Data channel connection
 	DCConn, err = appnet.DefNetwork().Dial(
