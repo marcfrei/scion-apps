@@ -264,7 +264,6 @@ func main() {
 		serverCCAddr pan.UDPAddr
 		clientBwpStr string
 		serverBwpStr string
-		interactive  bool
 		sequence     string
 		preference   string
 	)
@@ -274,7 +273,6 @@ func main() {
 	flag.Var(&serverCCAddr, "s", "Server SCION Address")
 	flag.StringVar(&serverBwpStr, "sc", DefaultBwtestParameters, "Server->Client test parameter")
 	flag.StringVar(&clientBwpStr, "cs", DefaultBwtestParameters, "Client->Server test parameter")
-	flag.BoolVar(&interactive, "i", false, "Interactive path selection, prompt to choose path")
 	flag.StringVar(&sequence, "sequence", "", "Sequence of space separated hop predicates to specify path")
 	flag.StringVar(&preference, "preference", "", "Preference sorting order for paths. "+
 		"Comma-separated list of available sorting options: "+
@@ -291,7 +289,7 @@ func main() {
 	if !serverCCAddr.IsValid() {
 		usageErr("server address needs to be specified with -s")
 	}
-	policy, err := pan.PolicyFromCommandline(sequence, preference, interactive)
+	policy, err := pan.PolicyFromCommandline(sequence, preference, false)
 	checkUsageErr(err)
 
 	// use default packet size when within same AS
@@ -320,13 +318,86 @@ func main() {
 	fmt.Printf("server->client: %d seconds, %d bytes, %d packets\n",
 		int(serverBwp.BwtestDuration/time.Second), serverBwp.PacketSize, serverBwp.NumPackets)
 
-	clientRes, serverRes, err := runBwtest(local.Get(), serverCCAddr, policy, clientBwp, serverBwp)
+	paths, err := bwtestPaths(context.Background(), local.Get(), serverCCAddr, policy)
 	bwtest.Check(err)
 
-	fmt.Println("\nS->C results")
-	printBwtestResult(serverBwp, clientRes)
-	fmt.Println("\nC->S results")
-	printBwtestResult(clientBwp, serverRes)
+	if len(paths) > 0 && paths[0] != nil {
+		fmt.Printf("\nTesting %d path(s) to %s\n", len(paths), serverCCAddr.IA)
+	} else {
+		fmt.Println("\nTesting direct path")
+	}
+
+	var failures int
+	for i, path := range paths {
+		if path != nil {
+			fmt.Printf("\nPath %d/%d: %s\n", i, len(paths), path)
+		}
+
+		runClientBwp, runServerBwp := parametersForRun(clientBwp, serverBwp)
+		clientRes, serverRes, err := runBwtest(local.Get(), serverCCAddr, policyForPath(path),
+			runClientBwp, runServerBwp)
+		if err != nil {
+			failures++
+			fmt.Fprintf(os.Stderr, "Path %d/%d failed: %v\n", i+1, len(paths), err)
+			continue
+		}
+
+		fmt.Println("\nS->C results")
+		printBwtestResult(runServerBwp, clientRes)
+		fmt.Println("\nC->S results")
+		printBwtestResult(runClientBwp, serverRes)
+	}
+	if failures > 0 {
+		bwtest.Check(fmt.Errorf("%d/%d path tests failed", failures, len(paths)))
+	}
+}
+
+func bwtestPaths(ctx context.Context, local netip.AddrPort, serverCCAddr pan.UDPAddr,
+	policy pan.Policy) ([]*pan.Path, error) {
+
+	localIA, err := localIA(ctx, local, serverCCAddr)
+	if err != nil {
+		return nil, err
+	}
+	if localIA == serverCCAddr.IA {
+		return []*pan.Path{nil}, nil
+	}
+
+	paths, err := pan.QueryPaths(ctx, serverCCAddr.IA)
+	if err != nil {
+		return nil, err
+	}
+	if policy != nil {
+		paths = policy.Filter(paths)
+	}
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("no paths available to %s", serverCCAddr.IA)
+	}
+	return paths, nil
+}
+
+func localIA(ctx context.Context, local netip.AddrPort, serverCCAddr pan.UDPAddr) (pan.IA, error) {
+	conn, err := pan.DialUDP(ctx, local, serverCCAddr)
+	if err != nil {
+		return pan.IA(0), err
+	}
+	defer conn.Close()
+	return conn.LocalAddr().(pan.UDPAddr).IA, nil
+}
+
+func parametersForRun(clientBwp, serverBwp bwtest.Parameters) (bwtest.Parameters, bwtest.Parameters) {
+	clientBwp.PrgKey = prepareAESKey()
+	clientBwp.Port = 0
+	serverBwp.PrgKey = prepareAESKey()
+	serverBwp.Port = 0
+	return clientBwp, serverBwp
+}
+
+func policyForPath(path *pan.Path) pan.Policy {
+	if path == nil {
+		return nil
+	}
+	return pan.Pinned{path.Fingerprint}
 }
 
 // runBwtest runs the bandwidth test with the given parameters against the server at serverCCAddr.
@@ -339,6 +410,7 @@ func runBwtest(local netip.AddrPort, serverCCAddr pan.UDPAddr, policy pan.Policy
 	if err != nil {
 		return
 	}
+	defer ccConn.Close()
 
 	dcLocal := netip.AddrPortFrom(local.Addr(), 0)
 	// Address of server data channel (DC)
@@ -349,6 +421,7 @@ func runBwtest(local netip.AddrPort, serverCCAddr pan.UDPAddr, policy pan.Policy
 	if err != nil {
 		return
 	}
+	defer dcConn.Close()
 	clientDCAddr := dcConn.LocalAddr().(pan.UDPAddr)
 	// DC ports are passed in the request
 	clientBwp.Port = clientDCAddr.Port
@@ -369,29 +442,30 @@ func runBwtest(local netip.AddrPort, serverCCAddr pan.UDPAddr, policy pan.Policy
 	finishTimeReceive := startTime.Add(serverBwp.BwtestDuration + bwtest.StragglerWaitPeriod)
 	finishTimeSend := startTime.Add(clientBwp.BwtestDuration + bwtest.GracePeriodSend)
 	if err = dcConn.SetReadDeadline(finishTimeReceive); err != nil {
-		dcConn.Close()
 		return
 	}
 	if err = dcConn.SetWriteDeadline(finishTimeSend); err != nil {
-		dcConn.Close()
 		return
 	}
 
 	// Pin DC to path used for request
 	if serverDCAddr.IA != clientDCAddr.IA {
-		dcConn.SetPolicy(pan.Pinned{ccSelector.Path(context.Background()).Fingerprint})
+		path := ccSelector.Path(context.Background())
+		if path == nil {
+			err = pan.ErrNoPath
+			return
+		}
+		dcConn.SetPolicy(pan.Pinned{path.Fingerprint})
 	}
 
 	// Start blasting client->server
 	err = bwtest.HandleDCConnSend(clientBwp, dcConn)
 	if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
-		dcConn.Close()
 		return
 	}
 
 	// Wait until receive is done as well
 	clientRes = <-receiveRes
-	dcConn.Close()
 
 	serverRes, err = requestResults(ccConn, clientBwp.PrgKey)
 	return
