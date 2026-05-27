@@ -264,6 +264,8 @@ func main() {
 		serverCCAddr pan.UDPAddr
 		clientBwpStr string
 		serverBwpStr string
+		allPaths     bool
+		interactive  bool
 		sequence     string
 		preference   string
 	)
@@ -273,6 +275,8 @@ func main() {
 	flag.Var(&serverCCAddr, "s", "Server SCION Address")
 	flag.StringVar(&serverBwpStr, "sc", DefaultBwtestParameters, "Server->Client test parameter")
 	flag.StringVar(&clientBwpStr, "cs", DefaultBwtestParameters, "Client->Server test parameter")
+	flag.BoolVar(&allPaths, "a", false, "Run test sequentially on all available paths")
+	flag.BoolVar(&interactive, "i", false, "Interactive path selection, prompt to choose path")
 	flag.StringVar(&sequence, "sequence", "", "Sequence of space separated hop predicates to specify path")
 	flag.StringVar(&preference, "preference", "", "Preference sorting order for paths. "+
 		"Comma-separated list of available sorting options: "+
@@ -286,10 +290,13 @@ func main() {
 	if flag.NFlag() == 0 {
 		usageErr("")
 	}
+	if allPaths && interactive {
+		usageErr("-a and -i are mutually exclusive")
+	}
 	if !serverCCAddr.IsValid() {
 		usageErr("server address needs to be specified with -s")
 	}
-	policy, err := pan.PolicyFromCommandline(sequence, preference, false)
+	policy, err := pan.PolicyFromCommandline(sequence, preference, interactive)
 	checkUsageErr(err)
 
 	// use default packet size when within same AS
@@ -317,6 +324,17 @@ func main() {
 		int(clientBwp.BwtestDuration/time.Second), clientBwp.PacketSize, clientBwp.NumPackets)
 	fmt.Printf("server->client: %d seconds, %d bytes, %d packets\n",
 		int(serverBwp.BwtestDuration/time.Second), serverBwp.PacketSize, serverBwp.NumPackets)
+
+	if !allPaths {
+		clientRes, serverRes, err := runBwtest(local.Get(), serverCCAddr, policy, clientBwp, serverBwp)
+		bwtest.Check(err)
+
+		fmt.Println("\nS->C results")
+		printBwtestResult(serverBwp, clientRes)
+		fmt.Println("\nC->S results")
+		printBwtestResult(clientBwp, serverRes)
+		return
+	}
 
 	paths, err := bwtestPaths(context.Background(), local.Get(), serverCCAddr, policy)
 	bwtest.Check(err)
